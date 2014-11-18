@@ -8,91 +8,116 @@
  */
 using System;
 using System.Linq;
+using System.Threading;
 using System.Collections.Generic;
 
 using KafkaNet.Protocol;
 using KafkaNet.Model;
+using KafkaNet.Common;
 
 namespace KafkaNet
 {
 	/// <summary>
-	/// Description of NativeHLConsumer. Should only be used per
+	/// A High level API with consumer group support. Automatic commits the offset for the group, and will return a non-blocking
+	/// message list to client.
+	/// TODO: Make sure offset tracking works in parallel (right now it will consume in a "at least once" manner)
 	/// </summary>
 	public class NativeHLConsumer : Consumer
 	{
 
 		protected string _consumerGroup;
-		
-		public NativeHLConsumer(ConsumerOptions options, string consumerGroup, params OffsetPosition[] positions) : base(options, positions){
-			if(_topic == null || _topic.Name != _options.Topic)
+
+		public NativeHLConsumer(ConsumerOptions options, string consumerGroup, params OffsetPosition[] positions)
+			: base(options, positions)
+		{
+			if (_topic == null || _topic.Name != _options.Topic)
 				_topic = _metadataQueries.GetTopic(_options.Topic);
 			_consumerGroup = consumerGroup;
 			RefreshOffsets();
 		}
-		
-		public void RefreshOffsets(){
+
+		/// <summary>
+		/// Refresh offset by fetching the offset from kafka server for this._consumerGroup; also check if the offset is within the range of
+		/// min-max offset in current topic, if not, set to minimum offset.
+		/// </summary>
+		public void RefreshOffsets()
+		{
 			var actualOffsets = _metadataQueries.GetTopicOffsetAsync(_options.Topic).Result;
-			var maxminGroups = actualOffsets.Select(x => new {pid = x.PartitionId, min = x.Offsets.Min(), max = x.Offsets.Max()});
-			
+			var maxminGroups = actualOffsets.Select(x => new { pid = x.PartitionId, min = x.Offsets.Min(), max = x.Offsets.Max() });
+
 			_topic.Partitions.ForEach(
-				partition => {
-					var conn = _options.Router.SelectBrokerRoute(_topic.Name, partition.PartitionId);
-					conn.Connection
+				partition =>
+				{
+					_options.Router.SelectBrokerRoute(_topic.Name, partition.PartitionId).Connection
 						.SendAsync(CreateOffsetFetchRequest(_consumerGroup, partition.PartitionId))
 						.Result.ForEach(
-							offsetResp => {
+							offsetResp =>
+							{
 								Console.WriteLine("fetch offset: " + offsetResp.ToString());
-								
-								if(actualOffsets.Any(x => x.PartitionId==partition.PartitionId)){
-									var actual = maxminGroups.First(x => x.pid==partition.PartitionId);
-									if(actual.min > offsetResp.Offset || actual.max < offsetResp.Offset){
+
+								if (actualOffsets.Any(x => x.PartitionId == partition.PartitionId))
+								{
+									var actual = maxminGroups.First(x => x.pid == partition.PartitionId);
+									if (actual.min > offsetResp.Offset || actual.max < offsetResp.Offset)
+									{
 										offsetResp.Offset = actual.min;
 									}
 								}
 								_partitionOffsetIndex.AddOrUpdate(partition.PartitionId, i => offsetResp.Offset, (i, l) => offsetResp.Offset);
 							});
-				});
+				}
+			);
 			
-
 		}
-		
-		public IEnumerable<Message> Consume(int num){
-//			RefreshOffsets();
-			var result = base.Consume(null).Take(num).ToList();
-//			var maxgroups = result.GroupBy(x => x.Meta.PartitionId).GroupJoin(;
-			var maxgroups = from r in result
-				group r by r.Meta.PartitionId into g
-				select new {pid = g.Key, offset = g.Max(m => m.Meta.Offset) + 1 };
+
+		/// <summary>
+		/// One time consuming certain num of messages specified, and stop consuming more at the end of call. It'll automatically increase
+		/// the offset by num and commit it. If fail to commit offset, it'll return null result.
+		/// </summary>
+		/// <param name="num"></param>
+		/// <returns></returns>
+		public IEnumerable<Message> Consume(int num, int timeout=1000)
+		{
+			List<Message> result = new List<Message>();
 			
-			maxgroups.ToList().ForEach(x => Console.WriteLine(x.pid + " : " + x.offset));
+			_options.Log.DebugFormat("Consumer: Beginning consumption of topic: {0}", _options.Topic);
+			_topicPartitionQueryTimer.Begin();
 			
-			foreach (var pos in maxgroups) {
-//				Console.WriteLine("partition: " + pos.Meta.PartitionId + " , offset: "+ pos.Meta.Offset);
-				
-				if(!CommitOffset(pos.pid, pos.offset)){
-					var mingroup = from r in result
-						group r by r.Meta.PartitionId into g
-						select new { pid = g.Key, offset = g.Min(m => m.Meta.Offset)};
-					mingroup.ToList().ForEach(x => CommitOffset(x.pid, x.offset));
+			while (result.Count < num) {
+				Message temp = null;
+				if(!_fetchResponseQueue.TryTake(out temp, timeout)){
 					return null;
+				}
+				
+				if(temp != null){
+					var conn = _options.Router.SelectBrokerRoute(_topic.Name, temp.Meta.PartitionId).Connection;
+					var offsets = conn.SendAsync(CreateOffsetFetchRequest(_consumerGroup, temp.Meta.PartitionId )).Result;
+					var x = offsets.FirstOrDefault();
+					
+					if(x != null && x.PartitionId == temp.Meta.PartitionId){
+						if(x.Offset > temp.Meta.Offset)
+							_options.Log.DebugFormat("GET Duplicated message");
+						else {
+							if(CommitOffset(conn, temp.Meta.PartitionId, temp.Meta.Offset+1))
+								result.Add(temp);
+						}
+					}
 				}
 			}
 			return result;
 		}
-		
-		protected bool CommitOffset(int pid, long offset){
-			Console.WriteLine("*** Committing partition: " + pid + ", offset: " + offset);
-			var conn = _options.Router.SelectBrokerRoute(_topic.Name, pid);
-			var resp = conn.Connection
-				.SendAsync(CreateOffsetCommitRequest(_consumerGroup, pid, offset)).Result.FirstOrDefault();
-			if(resp != null && ((int)resp.Error)== (int)ErrorResponseCode.NoError)
+
+		protected bool CommitOffset(IKafkaConnection conn, int pid, long offset)
+		{
+			var resp = conn.SendAsync(CreateOffsetCommitRequest(_consumerGroup, pid, offset)).Result.FirstOrDefault();
+			if (resp != null && ((int)resp.Error) == (int)ErrorResponseCode.NoError)
 				return true;
-			else {
-				Console.WriteLine(resp.Error + " topic name: "+ _topic.Name);
+			else
+			{
 				return false;
 			}
 		}
-		
+
 		protected OffsetFetchRequest CreateOffsetFetchRequest(string consumerGroup, int partitionId)
 		{
 			var request = new OffsetFetchRequest
@@ -110,7 +135,7 @@ namespace KafkaNet
 
 			return request;
 		}
-		
+
 		protected OffsetCommitRequest CreateOffsetCommitRequest(string consumerGroup, int partitionId, long offset, string metadata = null)
 		{
 			var commit = new OffsetCommitRequest
